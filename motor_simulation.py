@@ -1,12 +1,9 @@
-"""Simulación del motor asíncrono trifásico orientada a analizar tiempos y corrientes
-de arranque y frenado.
+"""Simulación del motor asíncrono trifásico orientada a analizar tiempos y corrientes de arranque y frenado.
 
-El código reproduce la lógica del script original de MATLAB, pero simplificado para
-centrar el estudio en:
+El código reproduce la lógica del script original de MATLAB, pero simplificado para centrar el estudio en:
 - Arranque a tensión plena.
-- Frenado por desenergización (motor en rueda libre).
-- Frenado por *plugging* (secuencia de tensión invertida en el eje q).
-- Frenado dinámico por inyección de corriente continua en el estator.
+- Frenado por desenergización.
+- Frenado dinámico por contracorriente.
 """
 
 from __future__ import annotations
@@ -24,15 +21,15 @@ import numpy as np
 
 
 @dataclass
-class ParametrosSimulacion:
+class SimulationParameters:
     """Constantes eléctricas, mecánicas y temporales del motor."""
 
     Rs: float = 3.7568
     Rr: float = 3.1329
     Rm: float = 2881.98
     lm_base: float = 0.569
-    incremento_lr: float = 0.01105
-    incremento_ls: float = 0.01624
+    lr_offset: float = 0.01105
+    ls_offset: float = 0.01624
     J: float = 0.00397
     D: float = 0.001764
     p: int = 2
@@ -57,29 +54,29 @@ class ParametrosSimulacion:
         return math.sqrt(2.0) * self.V1
 
 
-PerfilTension = Callable[[float, "ParametrosSimulacion"], tuple[np.ndarray, float]]
+VoltageProfile = Callable[[float, "SimulationParameters"], tuple[np.ndarray, float]]
 
 
 @dataclass
-class MetricasEvento:
+class EventMetrics:
     """Magnitudes características registradas en un evento dinámico."""
 
-    tiempo: Optional[float]
-    corriente: Optional[float]
-    velocidad: Optional[float]
+    time: Optional[float]
+    current: Optional[float]
+    speed: Optional[float]
 
 
 @dataclass
-class ResultadosSimulacion:
+class SimulationResults:
     """Variables principales a monitorear en cada escenario dinámico."""
 
-    tiempo: np.ndarray
-    corrientes_estator_dq: np.ndarray
-    corrientes_estator_abc: np.ndarray
+    time: np.ndarray
+    stator_currents_dq: np.ndarray
+    stator_currents_abc: np.ndarray
     torque: np.ndarray
-    velocidad_rotor: np.ndarray
-    razon_saturacion: Optional[np.ndarray] = None
-    metricas: Optional[Dict[str, MetricasEvento]] = None
+    rotor_speed: np.ndarray
+    saturation_ratio: Optional[np.ndarray] = None
+    metrics: Optional[Dict[str, EventMetrics]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +97,7 @@ def matriz_park(theta: float) -> np.ndarray:
     return (2.0 / 3.0) * base
 
 
-def perf_tension_completa(t: float, params: ParametrosSimulacion) -> tuple[np.ndarray, float]:
+def perf_tension_completa(t: float, params: SimulationParameters) -> tuple[np.ndarray, float]:
     """Entrega la tensión trifásica balanceada a tensión plena."""
 
     frecuencia = params.wb
@@ -114,42 +111,24 @@ def perf_tension_completa(t: float, params: ParametrosSimulacion) -> tuple[np.nd
     return vabc, frecuencia
 
 
-def perf_tension_nula(_: float, params: ParametrosSimulacion) -> tuple[np.ndarray, float]:
+def perf_tension_nula(_: float, params: SimulationParameters) -> tuple[np.ndarray, float]:
     """Perfile de desenergización: tensión cero en todas las fases."""
 
     return np.zeros(3), 0.0
 
 
-def perf_tension_plugging(t: float, params: ParametrosSimulacion) -> tuple[np.ndarray, float]:
-    """Perfil para frenado por plugging (inversión del componente q)."""
+def perf_tension_invertida(t: float, params: SimulationParameters) -> tuple[np.ndarray, float]:
+    """Perfil para frenado por contracorriente (inversión de fase)."""
 
-    frecuencia = params.wb
-    theta = frecuencia * t
-    matriz = matriz_park(theta)
-    matriz_inv = np.linalg.inv(matriz)
-
-    vabc_base = params.Vmax * np.array(
+    frecuencia = -params.wb
+    vabc = params.Vmax * np.array(
         [
             math.sin(frecuencia * t),
             math.sin(frecuencia * t - 2.0 * math.pi / 3.0),
             math.sin(frecuencia * t + 2.0 * math.pi / 3.0),
         ]
     )
-
-    vqds = matriz @ vabc_base
-    vqds[1] *= -1.0  # inversión del componente q para generar par contrario
-    vabc = matriz_inv @ vqds
     return vabc, frecuencia
-
-
-def perf_tension_inyeccion_cc(_: float, params: ParametrosSimulacion) -> tuple[np.ndarray, float]:
-    """Perfil de frenado dinámico mediante inyección de tensión continua en d."""
-
-    vd_dc = params.V1
-    matriz = matriz_park(0.0)
-    matriz_inv = np.linalg.inv(matriz)
-    vabc = matriz_inv @ np.array([vd_dc, 0.0, 0.0])
-    return vabc, 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +152,7 @@ def paso_rk4_corriente(I: np.ndarray, U: np.ndarray, R: np.ndarray, L_inv: np.nd
     return I + (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
 
 
-def paso_rk4_velocidad(wr: float, torque: float, params: ParametrosSimulacion, h: float) -> float:
+def paso_rk4_velocidad(wr: float, torque: float, params: SimulationParameters, h: float) -> float:
     """Integra la ecuación mecánica del rotor."""
 
     def dwr_dt(velocidad: float) -> float:
@@ -196,12 +175,12 @@ def paso_rk4_velocidad(wr: float, torque: float, params: ParametrosSimulacion, h
 
 
 def construir_matrices(
-    params: ParametrosSimulacion,
+    params: SimulationParameters,
     lm: float,
     ls: float,
     lr: float,
-    w_sincrona: float,
-    w_rotor: float,
+    w_syn: float,
+    w_r: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Genera las matrices R, L^{-1} y G del modelo eléctrico."""
 
@@ -223,11 +202,11 @@ def construir_matrices(
         ]
     )
 
-    velocidad_deslizamiento = w_sincrona - 0.5 * params.p * w_rotor
+    velocidad_deslizamiento = w_syn - 0.5 * params.p * w_r
     G = -np.array(
         [
-            [0.0, w_sincrona * ls, 0.0, w_sincrona * lm],
-            [-w_sincrona * ls, 0.0, -w_sincrona * lm, 0.0],
+            [0.0, w_syn * ls, 0.0, w_syn * lm],
+            [-w_syn * ls, 0.0, -w_syn * lm, 0.0],
             [0.0, lm * velocidad_deslizamiento, 0.0, lr * velocidad_deslizamiento],
             [-lm * velocidad_deslizamiento, 0.0, -lr * velocidad_deslizamiento, 0.0],
         ]
@@ -238,19 +217,19 @@ def construir_matrices(
 
 
 def calcular_metrica_evento(
-    params: ParametrosSimulacion,
+    params: SimulationParameters,
     tiempo: np.ndarray,
     velocidad_rotor: np.ndarray,
     corrientes: np.ndarray,
     tipo_evento: str,
-) -> MetricasEvento:
+) -> EventMetrics:
     """Determina el tiempo característico y la corriente pico para un evento."""
 
     velocidad_sincrona = 2.0 * params.wb / params.p
     magnitud_corriente = np.linalg.norm(corrientes[:, :2], axis=1)
 
     if magnitud_corriente.size == 0:
-        return MetricasEvento(tiempo=None, corriente=None, velocidad=None)
+        return EventMetrics(time=None, current=None)
 
     velocidad_evento: Optional[float]
 
@@ -291,7 +270,7 @@ def calcular_metrica_evento(
     else:
         raise ValueError(f"Tipo de evento no soportado: {tipo_evento}")
 
-    return MetricasEvento(tiempo=tiempo_evento, corriente=corriente_pico, velocidad=velocidad_evento)
+    return EventMetrics(time=tiempo_evento, current=corriente_pico, speed=velocidad_evento)
 
 
 # ---------------------------------------------------------------------------
@@ -300,15 +279,15 @@ def calcular_metrica_evento(
 
 
 def simular_iteracion(
-    params: ParametrosSimulacion,
-    perfil_saturacion: Optional[np.ndarray] = None,
-    corriente_inicial: Optional[np.ndarray] = None,
-    velocidad_inicial: float = 0.0,
-    perfil_tension: PerfilTension = perf_tension_completa,
-    permitir_actualizar_saturacion: bool = True,
-    etiqueta_evento: str = "evento",
-    tipo_evento: str = "start",
-) -> ResultadosSimulacion:
+    params: SimulationParameters,
+    saturation_profile: Optional[np.ndarray] = None,
+    initial_current: Optional[np.ndarray] = None,
+    initial_speed: float = 0.0,
+    voltage_profile: VoltageProfile = perf_tension_completa,
+    allow_saturation_update: bool = True,
+    event_label: str = "evento",
+    event_type: str = "start",
+) -> SimulationResults:
     """Ejecuta una simulación temporal para un escenario concreto."""
 
     tiempo = np.arange(params.ti, params.tf + params.dt / 2.0, params.dt)
@@ -319,29 +298,29 @@ def simular_iteracion(
     torque = np.zeros(pasos)
     velocidad_rotor = np.zeros(pasos)
     razon_saturacion = (
-        np.ones(pasos) if perfil_saturacion is None else perfil_saturacion.astype(float).copy()
+        np.ones(pasos) if saturation_profile is None else saturation_profile.astype(float).copy()
     )
 
-    I = np.zeros(4) if corriente_inicial is None else np.array(corriente_inicial, dtype=float)
-    wr = float(velocidad_inicial)
+    I = np.zeros(4) if initial_current is None else np.array(initial_current, dtype=float)
+    wr = float(initial_speed)
 
     for idx, t in enumerate(tiempo):
         # 1) Ajuste de inductancias según el perfil de saturación disponible
         sat = razon_saturacion[idx]
-        if perfil_saturacion is None and permitir_actualizar_saturacion:
+        if saturation_profile is None and allow_saturation_update:
             sat = max(sat, 1.0)
             razon_saturacion[idx] = sat
 
         lm = params.lm_base / sat
-        ls = lm + params.incremento_ls
-        lr = lm + params.incremento_lr
+        ls = lm + params.ls_offset
+        lr = lm + params.lr_offset
 
         # 2) Tensión aplicada y matrices del modelo eléctrico
-        vabc_t, w_sincrona = perfil_tension(t, params)
-        R, L_inv, G = construir_matrices(params, lm, ls, lr, w_sincrona, wr)
+        vabc_t, w_syn = voltage_profile(t, params)
+        R, L_inv, G = construir_matrices(params, lm, ls, lr, w_syn, wr)
 
         # 3) Transformación de Park para obtener tensiones dq
-        theta = w_sincrona * t
+        theta = w_syn * t
         Kqds = matriz_park(theta)
         Kqds_inv = np.linalg.inv(Kqds)
         vqds = Kqds @ vabc_t
@@ -362,7 +341,7 @@ def simular_iteracion(
         corrientes_abc[idx] = Kqds_inv @ np.array([I[0], I[1], 0.0])
 
         # 6) Actualización del modelo de saturación a partir de la corriente lineal
-        if perfil_saturacion is None and permitir_actualizar_saturacion:
+        if saturation_profile is None and allow_saturation_update:
             magnitud_linea = abs(I[0] + 1j * I[1]) / math.sqrt(2.0)
             if magnitud_linea > 1e-9:
                 lsat = (310.1 * magnitud_linea - 2.423 - 28.25) / 172.6
@@ -370,82 +349,70 @@ def simular_iteracion(
             else:
                 razon_saturacion[idx] = 1.0
 
-    metrica = calcular_metrica_evento(params, tiempo, velocidad_rotor, corrientes_dq, tipo_evento)
-    metricas = {etiqueta_evento: metrica}
+    metrica = calcular_metrica_evento(params, tiempo, velocidad_rotor, corrientes_dq, event_type)
+    metricas = {event_label: metrica}
 
-    return ResultadosSimulacion(
-        tiempo=tiempo,
-        corrientes_estator_dq=corrientes_dq,
-        corrientes_estator_abc=corrientes_abc,
+    return SimulationResults(
+        time=tiempo,
+        stator_currents_dq=corrientes_dq,
+        stator_currents_abc=corrientes_abc,
         torque=torque,
-        velocidad_rotor=velocidad_rotor,
-        razon_saturacion=razon_saturacion,
-        metricas=metricas,
+        rotor_speed=velocidad_rotor,
+        saturation_ratio=razon_saturacion,
+        metrics=metricas,
     )
 
 
-def simular_motor(params: Optional[ParametrosSimulacion] = None) -> Dict[str, ResultadosSimulacion]:
+def simular_motor(params: Optional[SimulationParameters] = None) -> Dict[str, SimulationResults]:
     """Configura los tres escenarios solicitados y devuelve sus resultados."""
 
     if params is None:
-        params = ParametrosSimulacion()
+        params = SimulationParameters()
 
     arranque_lineal = simular_iteracion(
         params,
-        etiqueta_evento="arranque_lineal",
-        tipo_evento="start",
+        event_label="arranque_lineal",
+        event_type="start",
     )
 
     arranque_saturado = simular_iteracion(
         params,
-        perfil_saturacion=arranque_lineal.razon_saturacion,
-        permitir_actualizar_saturacion=False,
-        etiqueta_evento="arranque_saturado",
-        tipo_evento="start",
+        saturation_profile=arranque_lineal.saturation_ratio,
+        allow_saturation_update=False,
+        event_label="arranque_saturado",
+        event_type="start",
     )
 
-    corriente_inicial = arranque_lineal.corrientes_estator_dq[-1]
-    velocidad_inicial = arranque_lineal.velocidad_rotor[-1]
+    corriente_inicial = arranque_lineal.stator_currents_dq[-1]
+    velocidad_inicial = arranque_lineal.rotor_speed[-1]
 
     frenado_desenergizado = simular_iteracion(
         params,
-        perfil_saturacion=arranque_lineal.razon_saturacion,
-        corriente_inicial=corriente_inicial,
-        velocidad_inicial=velocidad_inicial,
-        perfil_tension=perf_tension_nula,
-        permitir_actualizar_saturacion=False,
-        etiqueta_evento="frenado_desenergizado",
-        tipo_evento="stop",
+        saturation_profile=arranque_lineal.saturation_ratio,
+        initial_current=corriente_inicial,
+        initial_speed=velocidad_inicial,
+        voltage_profile=perf_tension_nula,
+        allow_saturation_update=False,
+        event_label="frenado_desenergizado",
+        event_type="stop",
     )
 
-    frenado_plugging = simular_iteracion(
+    frenado_contracorriente = simular_iteracion(
         params,
-        perfil_saturacion=arranque_lineal.razon_saturacion,
-        corriente_inicial=corriente_inicial,
-        velocidad_inicial=velocidad_inicial,
-        perfil_tension=perf_tension_plugging,
-        permitir_actualizar_saturacion=False,
-        etiqueta_evento="frenado_plugging",
-        tipo_evento="stop",
-    )
-
-    frenado_inyeccion_cc = simular_iteracion(
-        params,
-        perfil_saturacion=arranque_lineal.razon_saturacion,
-        corriente_inicial=corriente_inicial,
-        velocidad_inicial=velocidad_inicial,
-        perfil_tension=perf_tension_inyeccion_cc,
-        permitir_actualizar_saturacion=False,
-        etiqueta_evento="frenado_inyeccion_cc",
-        tipo_evento="stop",
+        saturation_profile=arranque_lineal.saturation_ratio,
+        initial_current=corriente_inicial,
+        initial_speed=velocidad_inicial,
+        voltage_profile=perf_tension_invertida,
+        allow_saturation_update=False,
+        event_label="frenado_contracorriente",
+        event_type="stop",
     )
 
     return {
         "arranque_lineal": arranque_lineal,
         "arranque_saturado": arranque_saturado,
         "frenado_desenergizado": frenado_desenergizado,
-        "frenado_plugging": frenado_plugging,
-        "frenado_inyeccion_cc": frenado_inyeccion_cc,
+        "frenado_contracorriente": frenado_contracorriente,
     }
 
 
@@ -454,7 +421,7 @@ def simular_motor(params: Optional[ParametrosSimulacion] = None) -> Dict[str, Re
 # ---------------------------------------------------------------------------
 
 
-def graficar_escenario(resultados: ResultadosSimulacion, titulo: str, etiqueta_evento: str) -> None:
+def graficar_escenario(resultados: SimulationResults, titulo: str, etiqueta_evento: str) -> None:
     """Genera gráficos básicos de velocidad y corriente del estator."""
 
     try:
@@ -463,29 +430,29 @@ def graficar_escenario(resultados: ResultadosSimulacion, titulo: str, etiqueta_e
         print("matplotlib no está disponible. No se generarán gráficos.")
         return
 
-    metricas = (resultados.metricas or {}).get(etiqueta_evento)
-    magnitud_corriente = np.linalg.norm(resultados.corrientes_estator_dq[:, :2], axis=1)
+    metricas = (resultados.metrics or {}).get(etiqueta_evento)
+    magnitud_corriente = np.linalg.norm(resultados.stator_currents_dq[:, :2], axis=1)
 
     fig, (ax_velocidad, ax_corriente) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
 
-    ax_velocidad.plot(resultados.tiempo, resultados.velocidad_rotor, label="ω_r (rad/s)")
+    ax_velocidad.plot(resultados.time, resultados.rotor_speed, label="ω_r (rad/s)")
     ax_velocidad.axhline(0.0, color="tab:gray", linestyle=":", linewidth=1.0, label="ω_r = 0")
     ax_velocidad.set_ylabel("Velocidad (rad/s)")
     ax_velocidad.set_title(f"{titulo} - Velocidad del rotor")
 
-    ax_corriente.plot(resultados.tiempo, magnitud_corriente, color="tab:red", label="|I_s|")
+    ax_corriente.plot(resultados.time, magnitud_corriente, color="tab:red", label="|I_s|")
     ax_corriente.set_ylabel("Corriente (A)")
     ax_corriente.set_xlabel("Tiempo (s)")
     ax_corriente.set_title(f"{titulo} - Corriente del estator")
 
-    if metricas and metricas.tiempo is not None:
+    if metricas and metricas.time is not None:
         for eje, texto in [
             (ax_velocidad, "Tiempo característico"),
             (ax_corriente, "Corriente característica"),
         ]:
-            eje.axvline(metricas.tiempo, color="tab:green", linestyle="--", alpha=0.7)
+            eje.axvline(metricas.time, color="tab:green", linestyle="--", alpha=0.7)
             eje.text(
-                metricas.tiempo,
+                metricas.time,
                 eje.get_ylim()[1] * 0.9,
                 texto,
                 rotation=90,
@@ -494,11 +461,11 @@ def graficar_escenario(resultados: ResultadosSimulacion, titulo: str, etiqueta_e
                 fontsize=9,
                 backgroundcolor="white",
             )
-        if metricas.velocidad is not None:
-            ax_velocidad.scatter(metricas.tiempo, metricas.velocidad, color="tab:purple", zorder=5)
+        if metricas.speed is not None:
+            ax_velocidad.scatter(metricas.time, metricas.speed, color="tab:purple", zorder=5)
             ax_velocidad.text(
-                metricas.tiempo,
-                metricas.velocidad,
+                metricas.time,
+                metricas.speed,
                 "  ω_r en evento",
                 color="tab:purple",
                 verticalalignment="bottom",
@@ -515,19 +482,19 @@ def graficar_escenario(resultados: ResultadosSimulacion, titulo: str, etiqueta_e
 # ---------------------------------------------------------------------------
 
 
-def _imprimir_metricas(resultados: ResultadosSimulacion, nombre: str) -> None:
+def _imprimir_metricas(resultados: SimulationResults, nombre: str) -> None:
     """Muestra en consola las métricas principales de un escenario."""
 
-    metricas = resultados.metricas or {}
+    metricas = resultados.metrics or {}
     if not metricas:
         print(f"No hay métricas para {nombre}.")
         return
 
     print(f"\nEscenario: {nombre}")
     for etiqueta, valores in metricas.items():
-        tiempo_txt = f"{valores.tiempo:.6f} s" if valores.tiempo is not None else "N/D"
-        corriente_txt = f"{valores.corriente:.6f} A" if valores.corriente is not None else "N/D"
-        velocidad_txt = f"{valores.velocidad:.6f} rad/s" if valores.velocidad is not None else "N/D"
+        tiempo_txt = f"{valores.time:.6f} s" if valores.time is not None else "N/D"
+        corriente_txt = f"{valores.current:.6f} A" if valores.current is not None else "N/D"
+        velocidad_txt = f"{valores.speed:.6f} rad/s" if valores.speed is not None else "N/D"
         print(f"  Evento '{etiqueta}':")
         print(f"    Tiempo característico: {tiempo_txt}")
         print(f"    Corriente pico: {corriente_txt}")
@@ -545,14 +512,9 @@ def main() -> None:
 
     # Graficar escenarios principales (si matplotlib está disponible)
     graficar_escenario(simulaciones["arranque_lineal"], "Arranque lineal", "arranque_lineal")
+    graficar_escenario(simulaciones["frenado_desenergizado"], "Frenado por desenergización", "frenado_desenergizado")
     graficar_escenario(
-        simulaciones["frenado_desenergizado"], "Frenado por desenergización", "frenado_desenergizado"
-    )
-    graficar_escenario(simulaciones["frenado_plugging"], "Frenado por plugging", "frenado_plugging")
-    graficar_escenario(
-        simulaciones["frenado_inyeccion_cc"],
-        "Frenado dinámico por inyección de CC",
-        "frenado_inyeccion_cc",
+        simulaciones["frenado_contracorriente"], "Frenado por contracorriente", "frenado_contracorriente"
     )
 
 
